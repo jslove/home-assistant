@@ -7,6 +7,7 @@ https://home-assistant.io/components/camera/
 """
 import asyncio
 import collections
+from contextlib import suppress
 from datetime import timedelta
 import logging
 import hashlib
@@ -37,6 +38,7 @@ STATE_RECORDING = 'recording'
 STATE_STREAMING = 'streaming'
 STATE_IDLE = 'idle'
 
+DEFAULT_CONTENT_TYPE = 'image/jpeg'
 ENTITY_IMAGE_URL = '/api/camera_proxy/{0}?token={1}'
 
 TOKEN_CHANGE_INTERVAL = timedelta(minutes=5)
@@ -58,7 +60,6 @@ def async_get_image(hass, entity_id, timeout=10):
         state.attributes.get(ATTR_ENTITY_PICTURE)
     )
 
-    response = None
     try:
         with async_timeout.timeout(timeout, loop=hass.loop):
             response = yield from websession.get(url)
@@ -70,17 +71,13 @@ def async_get_image(hass, entity_id, timeout=10):
             image = yield from response.read()
             return image
 
-    except (asyncio.TimeoutError, aiohttp.errors.ClientError):
+    except (asyncio.TimeoutError, aiohttp.ClientError):
         raise HomeAssistantError("Can't connect to {0}".format(url))
-
-    finally:
-        if response is not None:
-            yield from response.release()
 
 
 @asyncio.coroutine
 def async_setup(hass, config):
-    """Setup the camera component."""
+    """Set up the camera component."""
     component = EntityComponent(_LOGGER, DOMAIN, hass, SCAN_INTERVAL)
 
     hass.http.register_view(CameraImageView(component.entities))
@@ -105,6 +102,7 @@ class Camera(Entity):
     def __init__(self):
         """Initialize a camera."""
         self.is_streaming = False
+        self.content_type = DEFAULT_CONTENT_TYPE
         self.access_tokens = collections.deque([], 2)
         self.async_update_token()
 
@@ -125,12 +123,12 @@ class Camera(Entity):
 
     @property
     def brand(self):
-        """Camera brand."""
+        """Return the camera brand."""
         return None
 
     @property
     def model(self):
-        """Camera model."""
+        """Return the camera model."""
         return None
 
     def camera_image(self):
@@ -142,7 +140,7 @@ class Camera(Entity):
 
         This method must be run in the event loop and returns a coroutine.
         """
-        return self.hass.loop.run_in_executor(None, self.camera_image)
+        return self.hass.async_add_job(self.camera_image)
 
     @asyncio.coroutine
     def handle_async_mjpeg_stream(self, request):
@@ -153,16 +151,17 @@ class Camera(Entity):
         response = web.StreamResponse()
 
         response.content_type = ('multipart/x-mixed-replace; '
-                                 'boundary=--jpegboundary')
+                                 'boundary=--frameboundary')
         yield from response.prepare(request)
 
         def write(img_bytes):
             """Write image to stream."""
             response.write(bytes(
-                '--jpegboundary\r\n'
-                'Content-Type: image/jpeg\r\n'
+                '--frameboundary\r\n'
+                'Content-Type: {}\r\n'
                 'Content-Length: {}\r\n\r\n'.format(
-                    len(img_bytes)), 'utf-8') + img_bytes + b'\r\n')
+                    self.content_type, len(img_bytes)),
+                'utf-8') + img_bytes + b'\r\n')
 
         last_image = None
 
@@ -172,7 +171,7 @@ class Camera(Entity):
                 if not img_bytes:
                     break
 
-                if img_bytes is not None and img_bytes != last_image:
+                if img_bytes and img_bytes != last_image:
                     write(img_bytes)
 
                     # Chrome seems to always ignore first picture,
@@ -185,8 +184,8 @@ class Camera(Entity):
 
                 yield from asyncio.sleep(.5)
 
-        except (asyncio.CancelledError, ConnectionResetError):
-            _LOGGER.debug("Close stream by frontend.")
+        except asyncio.CancelledError:
+            _LOGGER.debug("Stream closed by frontend.")
             response = None
 
         finally:
@@ -195,7 +194,7 @@ class Camera(Entity):
 
     @property
     def state(self):
-        """Camera state."""
+        """Return the camera state."""
         if self.is_recording:
             return STATE_RECORDING
         elif self.is_streaming:
@@ -205,7 +204,7 @@ class Camera(Entity):
 
     @property
     def state_attributes(self):
-        """Camera state attributes."""
+        """Return the camera state attributes."""
         attr = {
             'access_token': self.access_tokens[-1],
         }
@@ -237,7 +236,7 @@ class CameraView(HomeAssistantView):
 
     @asyncio.coroutine
     def get(self, request, entity_id):
-        """Start a get request."""
+        """Start a GET request."""
         camera = self.entities.get(entity_id)
 
         if camera is None:
@@ -245,7 +244,7 @@ class CameraView(HomeAssistantView):
             return web.Response(status=status)
 
         authenticated = (request[KEY_AUTHENTICATED] or
-                         request.GET.get('token') in camera.access_tokens)
+                         request.query.get('token') in camera.access_tokens)
 
         if not authenticated:
             return web.Response(status=401)
@@ -255,36 +254,35 @@ class CameraView(HomeAssistantView):
 
     @asyncio.coroutine
     def handle(self, request, camera):
-        """Hanlde the camera request."""
+        """Handle the camera request."""
         raise NotImplementedError()
 
 
 class CameraImageView(CameraView):
     """Camera view to serve an image."""
 
-    url = "/api/camera_proxy/{entity_id}"
-    name = "api:camera:image"
+    url = '/api/camera_proxy/{entity_id}'
+    name = 'api:camera:image'
 
     @asyncio.coroutine
     def handle(self, request, camera):
         """Serve camera image."""
-        try:
-            image = yield from camera.async_camera_image()
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            with async_timeout.timeout(10, loop=request.app['hass'].loop):
+                image = yield from camera.async_camera_image()
 
-            if image is None:
-                return web.Response(status=500)
+            if image:
+                return web.Response(body=image,
+                                    content_type=camera.content_type)
 
-            return web.Response(body=image)
-
-        except asyncio.CancelledError:
-            _LOGGER.debug("Close stream by frontend.")
+        return web.Response(status=500)
 
 
 class CameraMjpegStream(CameraView):
     """Camera View to serve an MJPEG stream."""
 
-    url = "/api/camera_proxy_stream/{entity_id}"
-    name = "api:camera:stream"
+    url = '/api/camera_proxy_stream/{entity_id}'
+    name = 'api:camera:stream'
 
     @asyncio.coroutine
     def handle(self, request, camera):
